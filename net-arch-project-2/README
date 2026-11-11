@@ -1,0 +1,125 @@
+CS4254 Project 2: Simple DNS Client
+===================================
+
+Build:   make
+Run:     ./simplednsClient @<server[:port]> <name>
+Tests:   ./test.sh                  (comparison with the reference client)
+         ./tests/run_extra_tests.sh (malformed and unusual responses)
+
+
+High-level approach
+-------------------
+The client is split into three parts:
+
+  src/query.c       Builds the query. createQNAME() turns the name into DNS
+                    labels (length byte + characters, ending in a zero byte),
+                    and createDnsRequest() writes the 12-byte header (ID 0x0539,
+                    recursion desired, one question) followed by the question
+                    (QTYPE A, QCLASS IN).
+
+  src/response.c    Validates and interprets the reply. readName() decodes
+                    names, including compression pointers. parseDnsResponse()
+                    checks the header, the question and every resource record
+                    before anything is printed.
+
+  simplednsClient.c Parses the command line, sends the query over UDP with
+                    sendto(), and waits for the reply with poll() and
+                    recvfrom() until a 5-second deadline.
+
+All header fields are read and written byte by byte in network order instead
+of through a C struct with bit-fields, because bit-field layout depends on the
+compiler and the machine's byte order.
+
+The response is walked twice. The first pass checks the whole packet: the
+answer, authority and additional sections must all be well formed and must
+end exactly at the end of the packet. Only if that pass succeeds does the
+second pass print the IP and CNAME lines. A malformed packet therefore
+produces a single ERROR line and never a partial answer.
+
+Output rules:
+  - A record      ->  IP<tab>address<tab>auth|nonauth
+  - CNAME record  ->  CNAME<tab>alias<tab>auth|nonauth
+  - auth/nonauth comes from the AA bit in the response header
+  - NXDOMAIN, or a NOERROR reply with no A/CNAME answers  ->  NOTFOUND
+  - no valid reply within 5 seconds                       ->  NORESPONSE
+  - FORMERR, SERVFAIL, NOTIMP, REFUSED, other RCODEs, malformed packets,
+    and local failures (bad arguments, socket or send errors)  ->  ERROR<tab>reason
+
+
+Error handling
+--------------
+Command line: the server must be @a.b.c.d with an optional port from 1 to
+65535 (inet_pton and strtol, with no trailing characters). The name must have
+labels of 1-63 bytes and must be at most 255 bytes when encoded; one trailing
+dot is allowed. Invalid input produces an ERROR line before anything is sent.
+
+Ignored packets: datagrams from any address or port other than the server's,
+datagrams whose ID is not 0x0539, and datagrams without the QR (response) bit
+are silently ignored, and the client keeps waiting. The 5-second deadline is
+measured on a monotonic clock from when the query is sent, so a stream of
+ignored packets cannot extend the wait.
+
+Rejected responses (ERROR):
+  - shorter than the 12-byte header
+  - a nonzero opcode, or the TC (truncated) bit set
+  - a question count other than 1, or a question whose name (compared without
+    regard to case), type or class differs from the query
+  - a name that runs past the end of the packet, uses a reserved label type,
+    is longer than 255 bytes, or has a compression pointer that does not point
+    backwards (this rules out pointer loops); jumps are also capped at 64
+  - a record whose fixed fields or RDATA run past the end of the packet
+  - an A answer whose RDLENGTH is not 4, an A or CNAME answer whose class is
+    not IN, or a CNAME whose name does not fill its RDATA exactly
+  - extra bytes after the last record
+
+Answer records of other types (for example AAAA) are skipped. Bytes in names
+that are not printable, as well as '.' and '\' inside a label, are escaped the
+way dig prints them (\. \\ \DDD) so the output stays one line per record.
+
+Buffers: the receive buffer is 64 KB, so a large UDP reply is never cut off,
+and all name text is written with explicit length checks. The client runs
+cleanly under valgrind and compiles without warnings with -Wall -Wextra.
+
+
+Challenges
+----------
+- The starter header described the flags as C bit-fields. Their order in
+  memory does not match the order of the bits on the wire, so we replaced
+  them with masks on a 16-bit value read in network byte order.
+- Name compression: a pointer can lead to more labels that end in another
+  pointer, and a malicious packet can form a cycle. Requiring every pointer
+  to point backwards, together with the 255-byte name limit, guarantees the
+  decoder stops.
+- Timeouts: setting SO_RCVTIMEO once would restart the 5-second wait every
+  time an unrelated packet arrived, so we track the remaining time and pass
+  it to poll() on every iteration.
+- Strictness versus partial output: validating the whole packet before
+  printing is what keeps malformed responses from printing some answers
+  followed by an error.
+
+
+Testing
+-------
+1. ./test.sh compares our query dump and parsed answers with the reference
+   client on the course test server (172.21.222.45): google.com, www.cnn.com,
+   vt.edu, amazon.com, missing.cs4254 (NXDOMAIN), multi.cs4254 (several A
+   records, auth), alias.cs4254 (CNAME, auth), error.cs4254 (SERVFAIL) and the
+   5-second timeout against 192.0.2.1. All 9 tests pass.
+
+2. tests/run_extra_tests.sh starts tests/fake_dns_server.py, a small UDP
+   server on 127.0.0.1 that answers our query with a crafted packet, and checks
+   our output for 25 cases: NOERROR with no answers, a packet shorter than the
+   header, the TC bit, a wrong ID followed by the real reply, a non-response
+   (QR=0) followed by the real reply, a reply from another port followed by the
+   real reply, pointer loops, forward pointers, a 5-byte A record, RDLENGTH past
+   the end of the packet, trailing bytes, a mismatched question, a question
+   count of 0, REFUSED, FORMERR, an unknown RCODE, a CNAME chain using
+   compression, AAAA mixed with A, the AA flag, 40 A records (larger than 512
+   bytes), names that need escaping, a question echoed in uppercase, an
+   NXDOMAIN with an SOA in the authority section, a non-IN class, and no reply
+   at all. All 25 pass.
+
+3. Manual checks: invalid server strings, ports 0/70000/"5x", empty names,
+   "..", labels over 63 bytes, names over 255 bytes, trailing dots, and
+   mixed-case names; output compared with dig @172.21.222.45 <name>; and a
+   valgrind run with no errors.
